@@ -1,0 +1,4 @@
+interface:
+  display_name: "GB/T7714-2015-skill"
+  short_description: "检索核验参考文献并生成真实编号项和正文交叉引用字段"
+  default_prompt: "按 GB/T 7714-2015 为我的论文检索并整理真实参考文献，默认使用顺序编码、正文 Times New Roman 小四上标、真实编号项和真实交叉引用。"
