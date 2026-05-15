@@ -1,0 +1,12 @@
+[network]
+default_proxy = "http://127.0.0.1:7897"
+timeout = 20
+
+[search]
+default_sources = ["crossref", "openalex", "pubmed"]
+max_rows = 20
+
+[policy]
+prefer_conference_template = "[C]. //"
+default_reject_electronic = true
+arxiv_is_clue_only = true

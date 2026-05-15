@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,10 +15,34 @@ from xml.etree import ElementTree as ET
 
 sys.dont_write_bytecode = True
 
-from 公共库 import HEITI, NS, SIMSUN, TITLE_TEXT, TNR, XML_SPACE, looks_like_chapter_heading, qn, run_text
+from 公共库 import CITATION_PATTERN, HEITI, NS, SIMSUN, TITLE_TEXT, TNR, XML_SPACE, looks_like_chapter_heading, qn, run_text, validate_reference_text
 
 
 PLACEHOLDER_PATTERN = re.compile(r"\[\[CITE:([A-Za-z0-9_,.\- ]+)\]\]")
+FORMAL_SOURCE_KEYS = (
+    "verification_source",
+    "verification_url",
+    "source",
+    "source_url",
+    "publisher_url",
+    "database_record",
+    "formal_source",
+    "doi",
+    "DOI",
+    "isbn",
+    "ISBN",
+    "issn",
+    "ISSN",
+    "核验来源",
+    "核验来源 URL/DOI",
+    "正式来源",
+    "来源",
+)
+ELECTRONIC_ONLY_SOURCE_PATTERN = re.compile(
+    r"\b(arxiv|preprint|openreview|github|ctan|hugging\s*face|official\s+docs?|documentation|project\s+page)\b"
+    r"|预印本|官方文档|项目主页|网页",
+    re.IGNORECASE,
+)
 NUMBERING_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"
 SETTINGS_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"
 NUMBERING_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering"
@@ -132,6 +157,37 @@ def paragraph_visible_run_text(paragraph: ET.Element) -> str:
     return "".join(run_text(run) for run in paragraph.findall(qn("w:r")))
 
 
+def paragraph_has_preserved_citation_structure(paragraph: ET.Element) -> bool:
+    if paragraph.find(qn("w:bookmarkStart")) is not None or paragraph.find(qn("w:bookmarkEnd")) is not None:
+        return True
+    if paragraph.find(f".//{qn('w:fldChar')}") is not None or paragraph.find(f".//{qn('w:instrText')}") is not None:
+        return True
+    for run in paragraph.findall(qn("w:r")):
+        text = run_text(run)
+        if not CITATION_PATTERN.search(text):
+            continue
+        rpr = run.find(qn("w:rPr"))
+        vert = rpr.find(qn("w:vertAlign")) if rpr is not None else None
+        if vert is not None and vert.get(qn("w:val")) == "superscript":
+            return True
+    return False
+
+
+def document_citation_structure_counts(root: ET.Element) -> dict[str, int]:
+    return {
+        "field_chars": sum(1 for _ in root.iter(qn("w:fldChar"))),
+        "ref_instructions": sum(1 for node in root.iter(qn("w:instrText")) if re.search(r"\bREF\b", node.text or "")),
+        "bookmarks": sum(1 for _ in root.iter(qn("w:bookmarkStart"))),
+    }
+
+
+def assert_citation_structure_not_reduced(before: dict[str, int], after: dict[str, int]) -> None:
+    reduced = [key for key, value in before.items() if after.get(key, 0) < value]
+    if reduced:
+        details = ", ".join(f"{key}: {before[key]} -> {after.get(key, 0)}" for key in reduced)
+        raise ValueError(f"DOCX citation structure was reduced while replacing text runs: {details}")
+
+
 def first_run_insert_index(paragraph: ET.Element) -> int:
     children = list(paragraph)
     for index, child in enumerate(children):
@@ -148,6 +204,8 @@ def replace_citation_placeholders(root: ET.Element, references: list[dict[str, A
         source_text = paragraph_visible_run_text(paragraph)
         if not PLACEHOLDER_PATTERN.search(source_text):
             continue
+        if paragraph_has_preserved_citation_structure(paragraph):
+            raise ValueError("Refusing to rebuild a paragraph that already contains superscript citations, Word fields, or bookmarks.")
         new_runs = make_citation_replacement_runs(source_text, references)
         insert_at = first_run_insert_index(paragraph)
         for run in list(paragraph.findall(qn("w:r"))):
@@ -211,8 +269,7 @@ def make_reference_paragraph(item: dict[str, Any], num_id: str, ref_index: int, 
     jc.set(qn("w:val"), "both")
     ind = ET.SubElement(ppr, qn("w:ind"))
     ind.set(qn("w:left"), "0")
-    ind.set(qn("w:firstLine"), "0")
-    ind.set(qn("w:hanging"), "0")
+    ind.set(qn("w:hangingChars"), "200")
     bookmark_id = None
     if use_bookmark:
         bookmark_id = ref_index
@@ -352,6 +409,25 @@ def ensure_update_fields(files: dict[str, bytes]) -> None:
     ensure_document_relationship(files, SETTINGS_REL_TYPE, "settings.xml")
 
 
+def verification_source_value(item: dict[str, Any]) -> str:
+    values: list[str] = []
+    for key in FORMAL_SOURCE_KEYS:
+        value = item.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            values.extend(str(part).strip() for part in value if str(part).strip())
+        else:
+            text = str(value).strip()
+            if text:
+                values.append(text)
+    return " ; ".join(values)
+
+
+def source_is_electronic_only(source: str) -> bool:
+    return bool(ELECTRONIC_ONLY_SOURCE_PATTERN.search(source))
+
+
 def validate_manifest(references: list[dict[str, Any]]) -> None:
     seen: set[str] = set()
     for index, item in enumerate(references, start=1):
@@ -368,6 +444,24 @@ def validate_manifest(references: list[dict[str, Any]]) -> None:
             raise ValueError(f"GB/T 7714 entry must not include manual numbering: {key}")
         if not entry.endswith("."):
             raise ValueError(f"GB/T 7714 entry must end with an English period: {key}")
+        validation_errors = validate_reference_text(entry)
+        if validation_errors:
+            details = "; ".join(error["message"] for error in validation_errors)
+            raise ValueError(
+                f"Reference {key} does not match the required seven-format policy: {details} "
+                "If only electronic or preprint sources are available, explain this to the user and ask whether to skip, replace with a formally published source, or explicitly allow [EB/OL]."
+            )
+        source = verification_source_value(item)
+        if not source:
+            raise ValueError(
+                f"Reference {key} is missing a queryable verification source. "
+                "Manifest entries must record a DOI, publisher page, conference/journal website, database record, authoritative index, ISBN/ISSN, patent record, or equivalent formal source."
+            )
+        if source_is_electronic_only(source):
+            raise ValueError(
+                f"Reference {key} only records an electronic/preprint/project source: {source}. "
+                "Use a formally published and queryable source record, or explain to the user that the item cannot be written under the current rules."
+            )
 
 
 def write_base_docx(
@@ -388,8 +482,11 @@ def write_base_docx(
     numbering_root = ET.fromstring(files["word/numbering.xml"]) if "word/numbering.xml" in files else None
     numbering_root, num_id = ensure_reference_numbering(numbering_root)
 
+    before_citation_counts = document_citation_structure_counts(document_root)
     if replace_placeholders:
         replace_citation_placeholders(document_root, references)
+        after_citation_counts = document_citation_structure_counts(document_root)
+        assert_citation_structure_not_reduced(before_citation_counts, after_citation_counts)
     append_reference_section(document_root, references, num_id, use_bookmarks=use_bookmarks)
     document_root.attrib.pop(MC_IGNORABLE, None)
 
@@ -415,6 +512,11 @@ def powershell_single_quoted(value: str | Path) -> str:
 
 
 def insert_numbered_item_crossrefs_with_word(docx_path: str | Path, output_docx: str | Path, references: list[dict[str, Any]]) -> None:
+    powershell_exe = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell_exe is None:
+        raise NumberedItemCrossReferenceError(
+            "未找到 powershell/pwsh，无法调用 Windows Word COM 生成编号项交叉引用；可使用 --method auto 自动降级或 --method bookmark。"
+        )
     refs_json = json.dumps([{"key": str(item["key"]), "gbt7714": str(item["gbt7714"])} for item in references], ensure_ascii=False)
     script = rf"""
 $ErrorActionPreference = 'Stop'
@@ -522,7 +624,7 @@ try {{
         ps1 = Path(tmpdir) / "insert_numbered_item_crossrefs.ps1"
         ps1.write_text(script, encoding="utf-8-sig")
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+            [powershell_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
             text=True,
             capture_output=True,
             timeout=120,

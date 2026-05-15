@@ -32,9 +32,30 @@ XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 CITATION_PATTERN = re.compile(r"\[(?:\d+(?:\s*[-,，]\s*\d+)*)\]")
 MANUAL_NUMBER_PATTERN = re.compile(r"^\s*\[\d+\]")
 FULLWIDTH_PUNCTUATION_PATTERN = re.compile(r"[，：；（）]")
-EB_OL_DATE_PATTERN = re.compile(r"\[EB/OL\]\.\s*\(\d{4}-\d{2}-\d{2}\)")
 ACCESS_DATE_PATTERN = re.compile(r"\[\d{4}-\d{2}-\d{2}\]")
 URL_PATTERN = re.compile(r"https?://\S+")
+ARXIV_PATTERN = re.compile(r"\barxiv\b|arxiv:\s*\d{4}\.\d{4,5}", re.IGNORECASE)
+PREPRINT_PATTERN = re.compile(r"\bpreprint\b", re.IGNORECASE)
+ELECTRONIC_TRACE_PATTERN = re.compile(
+    r"\b(openreview|github|ctan|hugging\s*face|web\s?page|website|official\s+docs?|documentation|accessed|retrieved)\b"
+    r"|访问日期|引用日期|网页|项目主页|官方文档|电子资源|预印本",
+    re.IGNORECASE,
+)
+PAGE_RANGE_PATTERN = r"\d+[A-Za-z0-9:.\-–—]*\s*[-–—]\s*\d+[A-Za-z0-9:.\-–—]*"
+JOURNAL_REFERENCE_PATTERN = re.compile(
+    rf"^.+?\. .+?\[J\]\. .+?, \d{{4}}, [^:]+?\([^)]+\): {PAGE_RANGE_PATTERN}\.$"
+)
+BOOK_REFERENCE_PATTERN = re.compile(
+    rf"^.+?\. .+?\[M\]\. [^:]+: [^,]+, \d{{4}}: {PAGE_RANGE_PATTERN}\.$"
+)
+IN_CONFERENCE_REFERENCE_PATTERN = re.compile(
+    rf"^.+?\. .+?\. In.+?, .+?, .+?, .+?\. .+?, Eds?\., [^:]+: ?[^,]+, \d{{4}}: {PAGE_RANGE_PATTERN}\.$"
+)
+EXTRACTED_CONFERENCE_REFERENCE_PATTERN = re.compile(
+    rf"^.+?\. .+?\[C\]\. //.+?\. .+?\. [^:]+: [^,]+, \d{{4}}: {PAGE_RANGE_PATTERN}\.$"
+)
+DISSERTATION_REFERENCE_PATTERN = re.compile(r"^.+?\. .+?\[D\]\. [^:]+: [^,]+, \d{4}\.$")
+PATENT_REFERENCE_PATTERN = re.compile(r"^.+?\. .+?\[P\]\. [^,]+, .+\.$")
 ENGLISH_CHAPTER_HEADING_PATTERN = re.compile(
     r"^(Appendix|Acknowledg(?:e)?ments|Conclusion|References)\b",
     re.IGNORECASE,
@@ -403,6 +424,145 @@ def has_punctuation_spacing_issue(text: str) -> bool:
     return False
 
 
+def has_default_reference_indent(entry: dict[str, Any]) -> bool:
+    no_first_line = entry.get("first_line") in {None, "0"} and entry.get("first_line_chars") in {None, "0"}
+    no_left = entry.get("left") in {None, "0"} and entry.get("left_chars") in {None, "0"}
+    has_two_char_hanging = entry.get("hanging_chars") == "200" or entry.get("hanging") == "420"
+    return no_first_line and no_left and has_two_char_hanging
+
+
+def normalize_reference_text(text: str) -> str:
+    return re.sub(r"^\s*\[\d+\]\s*", "", text.strip())
+
+
+def _format_details(reference: str, pattern: re.Pattern[str], expected_fields: list[tuple[str, str]]) -> str:
+    if pattern.match(reference):
+        return ""
+    missing = [label for label, detector in expected_fields if not re.search(detector, reference)]
+    if missing:
+        return "缺失或异常字段: " + "、".join(missing)
+    return "字段顺序、标点或空格不符合模板"
+
+
+def _reference_format_error(code: str, template: str, details: str = "") -> dict[str, str]:
+    message = f"参考文献格式必须符合模板：{template}"
+    if details:
+        message += f"；{details}"
+    return {"code": code, "message": message}
+
+
+def validate_reference_text(text: str) -> list[dict[str, str]]:
+    reference = normalize_reference_text(text)
+    errors: list[dict[str, str]] = []
+
+    def add(code: str, message: str) -> None:
+        errors.append({"code": code, "message": message})
+
+    def add_format(code: str, template: str, pattern: re.Pattern[str], fields: list[tuple[str, str]]) -> None:
+        details = _format_details(reference, pattern, fields)
+        if details:
+            errors.append(_reference_format_error(code, template, details))
+
+    if "[EB/OL]" in reference:
+        add("reference.eb_ol_disallowed", "默认禁止使用第 6 条电子文献格式 [EB/OL]；请替换为正式出版文献，或向用户说明无法按当前规则写入。")
+    if URL_PATTERN.search(reference):
+        add("reference.url_disallowed", "最终参考文献条目不得残留 URL；电子来源只能作为检索线索或核验入口。")
+    if ARXIV_PATTERN.search(reference) or PREPRINT_PATTERN.search(reference):
+        add("reference.preprint_disallowed", "不得把 arXiv、preprint 或预印本伪装成正式参考文献；请核验正式出版版本或向用户说明。")
+    if ACCESS_DATE_PATTERN.search(reference):
+        add("reference.access_date_disallowed", "默认禁用电子文献格式，最终条目不得残留 [YYYY-MM-DD] 访问日期。")
+    if ELECTRONIC_TRACE_PATTERN.search(reference):
+        add("reference.electronic_trace_disallowed", "最终参考文献不得保留电子页面、官方文档、项目主页、访问说明或类似网页型来源痕迹；请核验正式出版记录。")
+
+    if "[J]" in reference:
+        add_format(
+            "reference.journal_format",
+            "作者. 题名[J]. 刊名, 年, 卷(期): 起-止页码.",
+            JOURNAL_REFERENCE_PATTERN,
+            [
+                ("作者与题名", r"^.+?\. .+?\[J\]\."),
+                ("刊名", r"\[J\]\. .+?,"),
+                ("年份", r", \d{4},"),
+                ("卷(期)", r", [^:]+?\([^)]+\):"),
+                ("起-止页码", PAGE_RANGE_PATTERN + r"\.$"),
+            ],
+        )
+    elif "[M]" in reference:
+        add_format(
+            "reference.book_format",
+            "著者. 书名[M]. 出版地: 出版者, 出版年: 起-止页码.",
+            BOOK_REFERENCE_PATTERN,
+            [
+                ("著者与书名", r"^.+?\. .+?\[M\]\."),
+                ("出版地", r"\[M\]\. [^:]+:"),
+                ("出版者", r": [^,]+,"),
+                ("出版年", r", \d{4}:"),
+                ("起-止页码", PAGE_RANGE_PATTERN + r"\.$"),
+            ],
+        )
+    elif "[C]" in reference:
+        add_format(
+            "reference.extracted_conference_format",
+            "作者. 题名[C]. //编者. 文集名. 出版地: 出版者, 出版年: 起-止页码.",
+            EXTRACTED_CONFERENCE_REFERENCE_PATTERN,
+            [
+                ("作者与题名", r"^.+?\. .+?\[C\]"),
+                ("[C]. //类型标识", r"\[C\]\. //"),
+                ("编者", r"//.+?\. "),
+                ("文集名", r"//.+?\. .+?\. "),
+                ("出版地", r"\. [^:]+:"),
+                ("出版者", r": [^,]+,"),
+                ("出版年", r", \d{4}:"),
+                ("起-止页码", PAGE_RANGE_PATTERN + r"\.$"),
+            ],
+        )
+    elif "[D]" in reference:
+        add_format(
+            "reference.dissertation_format",
+            "作者. 题名[D]. 授予学位地: 授予学位单位, 出版年.",
+            DISSERTATION_REFERENCE_PATTERN,
+            [
+                ("作者与题名", r"^.+?\. .+?\[D\]\."),
+                ("授予学位地", r"\[D\]\. [^:]+:"),
+                ("授予学位单位", r": [^,]+,"),
+                ("出版年", r", \d{4}\.$"),
+            ],
+        )
+    elif "[P]" in reference:
+        add_format(
+            "reference.patent_format",
+            "著者. 专利题名[P]. 专利号, 公告日期或公开日期.",
+            PATENT_REFERENCE_PATTERN,
+            [
+                ("著者与专利题名", r"^.+?\. .+?\[P\]\."),
+                ("专利号", r"\[P\]\. [^,]+,"),
+                ("公告日期或公开日期", r", .+\.$"),
+            ],
+        )
+    elif "[EB/OL]" in reference:
+        # Already reported as disallowed. Do not add type_missing.
+        pass
+    elif ". In" in reference:
+        add_format(
+            "reference.in_conference_format",
+            "著者. 题名. In文集名, 会议名, 会址, 开会时间. 编者, Eds., 出版地:出版者, 出版年: 页码范围.",
+            IN_CONFERENCE_REFERENCE_PATTERN,
+            [
+                ("著者与题名", r"^.+?\. .+?\. In"),
+                ("文集名/会议名/会址/开会时间", r"\. In.+?, .+?, .+?, .+?\."),
+                ("编者", r"\. .+?, Eds?\."),
+                ("出版地", r"Eds?\., [^:]+:"),
+                ("出版者", r": ?[^,]+,"),
+                ("出版年", r", \d{4}:"),
+                ("页码范围", PAGE_RANGE_PATTERN + r"\.$"),
+            ],
+        )
+    else:
+        add("reference.type_missing", "参考文献条目缺少可识别类型，或未匹配期刊、专著、会议论文、论文集析出、学位论文、专利格式。")
+
+    return errors
+
+
 def parse_citation_numbers(citation_text: str) -> set[int]:
     inner = citation_text.strip()[1:-1]
     numbers: set[int] = set()
@@ -478,8 +638,8 @@ def audit_document(package: DocxPackage) -> list[dict[str, Any]]:
             issue("reference.alignment", "参考文献条目不是双端对齐。", location, "warning", text)
         if entry["spacing_line"] != "300":
             issue("reference.line_spacing", "参考文献条目未直接设置为 1.25 倍行距。", location, "warning", text)
-        if any(entry.get(key) not in {None, "0"} for key in ("hanging", "hanging_chars", "first_line", "first_line_chars", "left", "left_chars")):
-            issue("reference.indent", "参考文献条目应无首行缩进、左缩进和悬挂缩进。", location, "warning", text)
+        if not has_default_reference_indent(entry):
+            issue("reference.indent", "参考文献条目应无首行缩进、无左缩进，并设置悬挂缩进两个字符。", location, "warning", text)
         if entry["font_east_asia"] and entry["font_east_asia"] != SIMSUN:
             issue("reference.cjk_font", "参考文献中文字体不是宋体。", location, "warning", text)
         if entry["font_size_pt"] and entry["font_size_pt"] != 10.5:
@@ -493,12 +653,8 @@ def audit_document(package: DocxPackage) -> list[dict[str, Any]]:
                 issue("reference.run_ascii_font", "参考文献条目中存在非 Times New Roman 英文字体运行。", run_location, "warning", run_text_value)
             if run["font_size_pt"] and run["font_size_pt"] != 10.5:
                 issue("reference.run_font_size", "参考文献条目中存在非五号 10.5 磅运行。", run_location, "warning", run_text_value)
-        if "[EB/OL]" in text and not EB_OL_DATE_PATTERN.search(text):
-            issue("reference.eb_ol_missing_update_date", "电子文献缺少真实发表或更新日期。", location, "error", text)
-        if "[EB/OL]" in text and not ACCESS_DATE_PATTERN.search(text):
-            issue("reference.eb_ol_missing_access_date", "电子文献缺少引用日期。", location, "error", text)
-        if "[EB/OL]" in text and not URL_PATTERN.search(text):
-            issue("reference.eb_ol_missing_url", "电子文献缺少 URL。", location, "error", text)
+        for validation_error in validate_reference_text(text):
+            issue(validation_error["code"], validation_error["message"], location, "error", text)
         paragraph = paragraphs(package)[entry["index"]]
         if paragraph_has_fallback_bookmark(paragraph):
             issue("reference.bookmark_present", "参考文献条目包含书签；这应仅作为编号项交叉引用失败后的 fallback 使用。", location, "warning", text)
